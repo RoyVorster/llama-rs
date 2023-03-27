@@ -1,6 +1,6 @@
 #![allow(non_camel_case_types)]
 
-use std::os::raw::{c_int, c_void};
+use std::{os::raw::{c_int, c_void}, ffi::{c_float, c_longlong}};
 
 pub type ggml_type = c_int;
 pub const GGML_TYPE_Q4_0: ggml_type = 0;
@@ -50,6 +50,7 @@ pub const GGML_OP_FLASH_FF: ggml_op = 33;
 pub const GGML_OP_COUNT: ggml_op = 34;
 
 pub type ggml_context = c_void;
+pub type ggml_fp16 = u16;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -228,4 +229,12 @@ extern "C" {
     pub fn ggml_build_forward_expand(cgraph: *mut ggml_cgraph, tensor: *mut ggml_tensor);
 
     pub fn ggml_graph_compute(ctx: *mut ggml_context, cgraph: *mut ggml_cgraph);
+
+    pub fn ggml_fp16_to_fp32(x: ggml_fp16) -> c_float;
+
+    pub fn ggml_fp32_to_fp16(x: c_float) -> ggml_fp16;
+
+    pub fn ggml_quantize_q4_0(src: *const c_float, dst: *mut c_float, n: c_int, k: c_int, qk: c_int, hist: *mut c_longlong) -> usize;
+
+    pub fn ggml_quantize_q4_1(src: *const c_float, dst: *mut c_float, n: c_int, k: c_int, qk: c_int, hist: *mut c_longlong) -> usize;
 }

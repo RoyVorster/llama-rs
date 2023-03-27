@@ -2,8 +2,8 @@ use std::{convert::Infallible, io::Write, path::Path};
 
 use cli_args::CLI_ARGS;
 use llama_rs::{
-    InferenceError, InferenceParameters, InferenceSession, InferenceSessionParameters, Model,
-    ModelKVMemoryType, TokenBias, Vocabulary, EOD_TOKEN_ID,
+    InferenceError, InferenceParameters, InferenceSessionParameters, InferenceSnapshot,
+    ModelKVMemoryType, TokenBias, Model, Vocabulary, EOD_TOKEN_ID,
 };
 use rand::{thread_rng, SeedableRng};
 use rustyline::error::ReadlineError;
@@ -89,6 +89,65 @@ fn dump_tokens(text: &str, vocab: &Vocabulary) -> Result<(), InferenceError> {
     Ok(())
 }
 
+fn load_model_with_progress(model_path: &String, n_ctx: usize) -> (Model, Vocabulary) {
+    let (model, vocab) = llama_rs::Model::load(&args.model_path, args.num_ctx_tokens as i32, |progress| {
+        use llama_rs::LoadProgress;
+        match progress {
+            LoadProgress::HyperparametersLoaded(hparams) => {
+                log::debug!("Loaded HyperParams {hparams:#?}")
+            }
+            LoadProgress::BadToken { index } => {
+                log::info!("Warning: Bad token in vocab at index {index}")
+            }
+            LoadProgress::ContextSize { bytes } => log::info!(
+                "ggml ctx size = {:.2} MB\n",
+                bytes as f64 / (1024.0 * 1024.0)
+            ),
+            LoadProgress::MemorySize { bytes, n_mem } => log::info!(
+                "Memory size: {} MB {}",
+                bytes as f32 / 1024.0 / 1024.0,
+                n_mem
+            ),
+            LoadProgress::PartLoading {
+                file,
+                current_part,
+                total_parts,
+            } => log::info!(
+                "Loading model part {}/{} from '{}'\n",
+                current_part,
+                total_parts,
+                file.to_string_lossy(),
+            ),
+            LoadProgress::PartTensorLoaded {
+                current_tensor,
+                tensor_count,
+                ..
+            } => {
+                if current_tensor % 8 == 0 {
+                    log::info!("Loaded tensor {current_tensor}/{tensor_count}");
+                }
+            }
+            LoadProgress::PartLoaded {
+                file,
+                byte_size,
+                tensor_count,
+            } => {
+                log::info!("Loading of '{}' complete", file.to_string_lossy());
+                log::info!(
+                    "Model size = {:.2} MB / num tensors = {}",
+                    byte_size as f64 / 1024.0 / 1024.0,
+                    tensor_count
+                );
+            }
+        }
+    })
+    .expect("Could not load model");
+
+    log::info!("Model fully loaded!");
+
+    (model, vocab)
+}
+
 fn main() {
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
@@ -154,61 +213,7 @@ fn main() {
         std::process::exit(1);
     };
 
-    let (model, vocab) =
-        llama_rs::Model::load(&args.model_path, args.num_ctx_tokens as i32, |progress| {
-            use llama_rs::LoadProgress;
-            match progress {
-                LoadProgress::HyperparametersLoaded(hparams) => {
-                    log::debug!("Loaded HyperParams {hparams:#?}")
-                }
-                LoadProgress::BadToken { index } => {
-                    log::info!("Warning: Bad token in vocab at index {index}")
-                }
-                LoadProgress::ContextSize { bytes } => log::info!(
-                    "ggml ctx size = {:.2} MB\n",
-                    bytes as f64 / (1024.0 * 1024.0)
-                ),
-                LoadProgress::MemorySize { bytes, n_mem } => log::info!(
-                    "Memory size: {} MB {}",
-                    bytes as f32 / 1024.0 / 1024.0,
-                    n_mem
-                ),
-                LoadProgress::PartLoading {
-                    file,
-                    current_part,
-                    total_parts,
-                } => log::info!(
-                    "Loading model part {}/{} from '{}'\n",
-                    current_part,
-                    total_parts,
-                    file.to_string_lossy(),
-                ),
-                LoadProgress::PartTensorLoaded {
-                    current_tensor,
-                    tensor_count,
-                    ..
-                } => {
-                    if current_tensor % 8 == 0 {
-                        log::info!("Loaded tensor {current_tensor}/{tensor_count}");
-                    }
-                }
-                LoadProgress::PartLoaded {
-                    file,
-                    byte_size,
-                    tensor_count,
-                } => {
-                    log::info!("Loading of '{}' complete", file.to_string_lossy());
-                    log::info!(
-                        "Model size = {:.2} MB / num tensors = {}",
-                        byte_size as f64 / 1024.0 / 1024.0,
-                        tensor_count
-                    );
-                }
-            }
-        })
-        .expect("Could not load model");
-
-    log::info!("Model fully loaded!");
+    let (mut model, vocab) = load_model_with_progress(&args.model_path, args.num_ctx_tokens);
 
     if args.dump_prompt_tokens {
         dump_tokens(&prompt, &vocab).ok();

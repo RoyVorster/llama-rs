@@ -10,6 +10,7 @@ use std::{
     time,
 };
 
+use ggml::QuantizationMethod;
 use thiserror::Error;
 
 use partial_sort::PartialSort;
@@ -367,6 +368,10 @@ pub enum LoadProgress<'a> {
 
 #[derive(Error, Debug)]
 pub enum LoadError {
+    #[error("invalid file path {path:?}")]
+    InvalidFilePath {
+        path: PathBuf,
+    },
     #[error("could not open file {path:?}")]
     OpenFileFailed {
         source: std::io::Error,
@@ -374,6 +379,11 @@ pub enum LoadError {
     },
     #[error("no parent path for {path:?}")]
     NoParentPath { path: PathBuf },
+    #[error("unable to write {bytes} bytes")]
+    WriteFailed {
+        source: std::io::Error,
+        bytes: usize,
+    },
     #[error("unable to read exactly {bytes} bytes")]
     ReadExactFailed {
         source: std::io::Error,
@@ -401,6 +411,10 @@ pub enum LoadError {
     TensorWrongSize { tensor_name: String, path: PathBuf },
     #[error("invalid ftype {ftype} in {path:?}")]
     InvalidFtype { ftype: i32, path: PathBuf },
+    #[error("model with ftype {ftype} already quantized, {path:?}")]
+    ModelAlreadyQuantized { ftype: i32, path: PathBuf },
+    #[error("invalid quantization method")]
+    InvalidQuantizationMethod,
 }
 
 #[derive(Error, Debug)]
@@ -447,63 +461,211 @@ macro_rules! mulf {
     };
 }
 
+pub struct DataForQuantization {
+    data_f16: Vec<ggml_raw::ggml_fp16>,
+    data_f32: Vec<f32>,
+
+    work: Vec<f32>,
+
+    history: Vec<i64>,
+
+    n_elements: i32,
+    n_rows: i32,
+}
+
+impl DataForQuantization {
+    const QK: i32 = 32;
+
+    fn with_capacity(n_elements: i32, n_rows: i32) -> Self {
+        DataForQuantization {
+            data_f16: Vec::<ggml_raw::ggml_fp16>::with_capacity(n_elements as usize),
+            data_f32: Vec::<f32>::with_capacity(n_elements as usize),
+            work: Vec::<f32>::with_capacity(n_elements as usize),
+            n_elements,
+                n_rows,
+                history: Vec::<i64>::with_capacity(1 << 4),
+            }
+        }
+
+    fn load_f16(handler: &mut ReadWrite, n_elements: i32, n_rows: i32) -> Result<Self, LoadError> {
+        let mut data = Self::with_capacity(n_elements, n_rows);
+        for i in 0..n_elements as usize {
+            data.data_f16[i] = handler.read_u16(false)?;
+            data.data_f32[i] = ggml::fp16_to_fp32(data.data_f16[i]);
+        }
+
+        Ok(data)
+    }
+
+    fn load_f32(handler: &mut ReadWrite, n_elements: i32, n_rows: i32) -> Result<Self, LoadError> {
+        let mut data = Self::with_capacity(n_elements, n_rows);
+        for i in 0..n_elements as usize {
+            data.data_f32[i] = handler.read_f32(false)?;
+        }
+
+        Ok(data)
+    }
+
+    fn quantize(&mut self, quantization_function: ggml::QuantizationFunction) -> usize {
+        quantization_function(&self.data_f32, &mut self.work, self.n_elements, self.n_rows, Self::QK, &mut self.history)
+    }
+}
+
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Write};
+
+pub struct ReadWrite {
+    reader: BufReader<File>,
+    writer: Option<File>,
+}
+
+impl ReadWrite {
+    fn initialize(path: &Path, output_path: Option<&Path>) -> Result<Self, LoadError> {
+        let writer = match output_path {
+            Some(p) => Some(File::create(p)
+                .map_err(|e| LoadError::OpenFileFailed {
+                    source: e,
+                    path: p.to_owned()
+                })?),
+            None => None,
+        };
+
+        Ok(ReadWrite {
+            reader: Self::get_bufreader_for_path(path)?,
+            writer: writer,
+        })
+    }
+
+    fn get_bufreader_for_path(path: &Path) -> Result<BufReader<File>, LoadError> {
+        Ok(BufReader::new(
+            File::open(path).map_err(|e| LoadError::OpenFileFailed { source: e, path: path.to_owned() })?,
+        ))
+    }
+
+    fn set_reader(&mut self, path: &Path) -> Result<(), LoadError> {
+        self.reader = Self::get_bufreader_for_path(path)?;
+        Ok(())
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), LoadError> {
+        if let Some(output_file) = &mut self.writer {
+            output_file
+                .write(bytes)
+                .map_err(|e| LoadError::WriteFailed {
+                    source: e,
+                    bytes: bytes.len(),
+                })?;
+        }
+
+        Ok(())
+    }
+
+    fn read_exact(&mut self, bytes: &mut [u8], write: bool) -> Result<(), LoadError> {
+        self.reader
+            .read_exact(bytes)
+            .map_err(|e| LoadError::ReadExactFailed {
+                source: e,
+                bytes: bytes.len(),
+            })?;
+
+        // Write the bytes straight back if desired
+        if write {
+            self.write(bytes)?;
+        }
+
+        Ok(())
+    }
+
+    fn is_eof(&mut self) -> Result<bool, LoadError> {
+        // NOTE: Implementation from #![feature(buf_read_has_data_left)]
+        Ok(self.reader.fill_buf().map(|b| b.is_empty())?)
+    }
+
+    fn seek(&mut self, seek_from: SeekFrom) -> Result<(), LoadError> {
+        self.reader.seek(seek_from)?;
+
+        Ok(())
+    }
+
+    fn read_bytes<const N: usize>(&mut self, write: bool) -> Result<[u8; N], LoadError> {
+        let mut bytes = [0u8; N];
+        self.read_exact(&mut bytes, write)?;
+
+        Ok(bytes)
+    }
+
+    fn read_string(&mut self, len: usize, write: bool) -> Result<String, LoadError> {
+        let mut buf = vec![0; len];
+        self.read_exact(&mut buf, write)?;
+
+        let s = String::from_utf8(buf)
+            .map_err(|e| LoadError::InvalidUtf8(e))?;
+        Ok(s)
+    }
+
+    fn read_i32(&mut self, write: bool) -> Result<i32, LoadError> {
+        Ok(i32::from_le_bytes(self.read_bytes::<4>(write)?))
+    }
+
+    fn read_u32(&mut self, write: bool) -> Result<u32, LoadError> {
+        Ok(u32::from_le_bytes(self.read_bytes::<4>(write)?))
+    }
+
+    fn read_u16(&mut self, write: bool) -> Result<u16, LoadError> {
+        Ok(u16::from_le_bytes(self.read_bytes::<2>(write)?))
+    }
+
+    fn read_f32(&mut self, write: bool) -> Result<f32, LoadError> {
+        Ok(f32::from_le_bytes(self.read_bytes::<4>(write)?))
+    }
+}
+
+type ModelLoadResult = Result<(Model, Vocabulary), LoadError>;
+
 impl Model {
     pub fn load(
         path: impl AsRef<Path>,
         n_ctx: i32,
         load_progress_callback: impl Fn(LoadProgress),
-    ) -> Result<(Model, Vocabulary), LoadError> {
-        use std::fs::File;
-        use std::io::BufReader;
+    ) -> ModelLoadResult {
+        Model::load_and_quantize(path, n_ctx, load_progress_callback, None, None::<String>)
+    }
 
+    pub fn quantize(
+        path: impl AsRef<Path>,
+        n_ctx: i32,
+        load_progress_callback: impl Fn(LoadProgress),
+        quantization_method: &QuantizationMethod,
+    ) -> Result<(), LoadError> {
         let main_path = path.as_ref();
+        let file_name = match main_path.file_name().and_then(|f| f.to_str()) {
+            Some(file_name) => file_name.to_owned(),
+            None => return Err(LoadError::InvalidFilePath { path: main_path.to_owned() }),
+        };
 
-        let mut reader =
-            BufReader::new(
-                File::open(main_path).map_err(|e| LoadError::OpenFileFailed {
-                    source: e,
-                    path: main_path.to_owned(),
-                })?,
-            );
+        // Get output path through concatenation
+        let output_path = main_path.with_file_name(file_name + "_quantized");
+        Model::load_and_quantize(path, n_ctx, load_progress_callback, Some(quantization_method), Some(output_path))?;
+        Ok(())
+    }
 
-        fn read_bytes<const N: usize>(reader: &mut impl BufRead) -> Result<[u8; N], LoadError> {
-            let mut bytes = [0u8; N];
-            reader
-                .read_exact(&mut bytes)
-                .map_err(|e| LoadError::ReadExactFailed {
-                    source: e,
-                    bytes: N,
-                })?;
-            Ok(bytes)
-        }
+    pub fn load_and_quantize(
+        path: impl AsRef<Path>,
+        n_ctx: i32,
+        load_progress_callback: impl Fn(LoadProgress),
+        quantization_method: Option<&QuantizationMethod>,
+        output_path: Option<impl AsRef<Path>>,
+    ) -> ModelLoadResult {
+        let main_path = path.as_ref();
+        let main_output_path = output_path.as_ref().map(|p| p.as_ref());
 
-        fn read_i32(reader: &mut impl BufRead) -> Result<i32, LoadError> {
-            Ok(i32::from_le_bytes(read_bytes::<4>(reader)?))
-        }
+        let mut handler = ReadWrite::initialize(main_path, main_output_path)?;
 
-        fn read_u32(reader: &mut impl BufRead) -> Result<u32, LoadError> {
-            Ok(u32::from_le_bytes(read_bytes::<4>(reader)?))
-        }
-
-        fn read_f32(reader: &mut impl BufRead) -> Result<f32, LoadError> {
-            Ok(f32::from_le_bytes(read_bytes::<4>(reader)?))
-        }
-
-        /// Helper function. Reads a string from the buffer and returns it.
-        fn read_string(reader: &mut BufReader<File>, len: usize) -> Result<String, LoadError> {
-            let mut buf = vec![0; len];
-            reader
-                .read_exact(&mut buf)
-                .map_err(|e| LoadError::ReadExactFailed {
-                    source: e,
-                    bytes: buf.len(),
-                })?;
-            let s = String::from_utf8(buf)?;
-            Ok(s)
-        }
+        let do_write: bool = main_output_path.is_some();
+        let do_quantize = quantization_method.is_some();
 
         // Verify magic
-        let is_legacy_model: bool = match read_i32(&mut reader)? {
+        let is_legacy_model: bool = match handler.read_i32(do_write)? {
             ggml::FILE_MAGIC => false,
             ggml::FILE_MAGIC_UNVERSIONED => true,
             _ => {
@@ -516,7 +678,7 @@ impl Model {
         // Load format version
         if !is_legacy_model {
             #[allow(unused_variables)]
-            let version: u32 = match read_u32(&mut reader)? {
+            let version: u32 = match handler.read_u32(do_write)? {
                 ggml::FORMAT_VERSION => ggml::FORMAT_VERSION,
                 version => return Err(LoadError::InvalidFormatVersion { value: version }),
             };
@@ -529,14 +691,14 @@ impl Model {
         // NOTE: Field order matters! Data is laid out in the file exactly
         // in this order.
         let hparams = Hyperparameters {
-            n_vocab: read_i32(&mut reader)?,
+            n_vocab: handler.read_i32(do_write)?,
             n_ctx,
-            n_embd: read_i32(&mut reader)?,
-            n_mult: read_i32(&mut reader)?,
-            n_head: read_i32(&mut reader)?,
-            n_layer: read_i32(&mut reader)?,
-            n_rot: read_i32(&mut reader)?,
-            f16_: read_i32(&mut reader)?,
+            n_embd: handler.read_i32(do_write)?,
+            n_mult: handler.read_i32(do_write)?,
+            n_head: handler.read_i32(do_write)?,
+            n_layer: handler.read_i32(do_write)?,
+            n_rot: handler.read_i32(do_write)?,
+            f16_: handler.read_i32(do_write)?,
         };
 
         let n_ff =
@@ -554,8 +716,8 @@ impl Model {
             let mut max_token_length = 0;
 
             for i in 0..hparams.n_vocab {
-                let len = read_i32(&mut reader)?;
-                if let Ok(word) = read_string(&mut reader, len as usize) {
+                let len = handler.read_i32(do_write)?;
+                if let Ok(word) = handler.read_string(len as usize, do_write) {
                     max_token_length = max_token_length.max(word.len());
                     id_to_token.push(word.clone());
                     token_to_id.insert(word, i);
@@ -567,14 +729,8 @@ impl Model {
                 }
 
                 // Token score, currently unused
-                if !is_legacy_model {
-                    if let Ok(score) = read_f32(&mut reader) {
-                        id_to_token_score.push(score);
-                    }
-                } else {
-                    // Legacy model, set empty score
-                    id_to_token_score.push(0.);
-                }
+                let score = if is_legacy_model { 0.0 } else { handler.read_f32(do_write)? };
+                id_to_token_score.push(score);
             }
 
             Vocabulary {
@@ -709,8 +865,7 @@ impl Model {
 
         // Close the file, but keep its offset. That way we know how to skip the
         // metadata when loading the parts.
-        let file_offset = reader.stream_position()?;
-        drop(reader);
+        let file_offset = handler.reader.stream_position()?;
 
         let paths = {
             let main_filename = main_path.file_name().and_then(|p| p.to_str());
@@ -746,35 +901,32 @@ impl Model {
                 total_parts: n_parts,
             });
 
-            let mut part_reader = BufReader::new(File::open(&part_path)?);
+            handler.set_reader(&part_path)?;
 
             // Skip metadata
-            part_reader.seek(SeekFrom::Start(file_offset))?;
+            handler.seek(SeekFrom::Start(file_offset))?;
 
             let mut total_size = 0;
             let mut n_tensors = 0;
 
             // Load weights
             loop {
-                // NOTE: Implementation from #![feature(buf_read_has_data_left)]
-                let is_eof = part_reader.fill_buf().map(|b| b.is_empty())?;
-
-                if is_eof {
+                if handler.is_eof()? {
                     break;
                 }
 
-                let n_dims = read_i32(&mut part_reader)?;
-                let length = read_i32(&mut part_reader)?;
-                let ftype = read_i32(&mut part_reader)?;
+                let n_dims = handler.read_i32(do_write)?;
+                let length = handler.read_i32(do_write)?;
+                let ftype = handler.read_i32(do_write)?;
 
                 let mut nelements = 1;
                 let mut ne = [1i32, 1i32];
                 for i in 0..n_dims {
-                    ne[i as usize] = read_i32(&mut part_reader)?;
+                    ne[i as usize] = handler.read_i32(do_write)?;
                     nelements *= ne[i as usize];
                 }
 
-                let tensor_name = read_string(&mut part_reader, length as usize)?;
+                let tensor_name = handler.read_string(length as usize, do_write)?;
 
                 let Some(tensor) = model.tensors.get(&tensor_name)
                     else {
@@ -854,24 +1006,68 @@ impl Model {
                     });
                 }
 
-                let bpe = match ftype {
-                    0 => ggml::type_size(ggml::TYPE_F32),
-                    1 => ggml::type_size(ggml::TYPE_F16),
-                    2 => {
+                let bpe = match (ftype, do_quantize) {
+                    (0, _) => ggml::type_size(ggml::TYPE_F32),
+                    (1, _) => ggml::type_size(ggml::TYPE_F16),
+                    // These two arms suggest the model was already quantized
+                    (2, false) => {
                         assert_eq!(ne[0] % 64, 0);
                         ggml::type_size(ggml::TYPE_Q4_0)
                     }
-                    3 => {
+                    (3, false) => {
                         assert_eq!(ne[0] % 64, 0);
                         ggml::type_size(ggml::TYPE_Q4_1)
                     }
-                    _ => {
+                    (2 | 3, true) => {
+                        return Err(LoadError::ModelAlreadyQuantized {
+                            ftype,
+                            path: part_path
+                        })
+                    }
+                    (_, _) => {
                         return Err(LoadError::InvalidFtype {
                             ftype,
                             path: part_path,
                         })
                     }
                 };
+
+                // If this is a quantization run we simply load the raw data in the desired format
+                if do_quantize {
+                    if n_dims == 2 {
+                        let mut quantization_data = match ftype {
+                            ggml::TYPE_F16 => DataForQuantization::load_f16(&mut handler, nelements, ne[0])?,
+                            ggml::TYPE_F32 => DataForQuantization::load_f32(&mut handler, nelements, ne[0])?,
+                            _ => return Err(LoadError::InvalidFtype {
+                                ftype,
+                                path: part_path,
+                            }),
+                        };
+
+                        let quantization_function: ggml::QuantizationFunction = match quantization_method {
+                            Some(QuantizationMethod::Q4_0) => ggml::ggml_quantize_q4_0,
+                            Some(QuantizationMethod::Q4_1) => ggml::ggml_quantize_q4_1,
+                            _ => return Err(LoadError::InvalidQuantizationMethod),
+                        };
+                        let new_size = quantization_data.quantize(quantization_function);
+
+                        // Write the raw bytes
+                        let new_data_bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                quantization_data.work.as_ptr() as *const u8,
+                                new_size,
+                            )
+                        };
+
+                        handler.write(new_data_bytes)?;
+                    } else {
+                        let mut buffer = vec![0; (nelements as usize) * bpe];
+                        handler.read_exact(&mut buffer, true)?;
+                    }
+
+                    // No need to parse weights when we're quantizing
+                    continue;
+                }
 
                 if n_dims == 1 || n_parts == 1 {
                     if (nelements as usize * bpe) / ggml::blck_size(tensor.get_type()) as usize
@@ -890,12 +1086,10 @@ impl Model {
                         let slice = unsafe {
                             std::slice::from_raw_parts_mut(data as *mut u8, tensor.nbytes())
                         };
-                        part_reader.read_exact(slice)?;
+                        handler.read_exact(slice, false)?;
                     } else {
-                        part_reader.seek(SeekFrom::Current(tensor.nbytes() as i64))?;
+                        handler.seek(SeekFrom::Current(tensor.nbytes() as i64))?;
                     }
-
-                    total_size += tensor.nbytes();
                 } else {
                     if (nelements as usize * bpe) / ggml::blck_size(tensor.get_type()) as usize
                         != tensor.nbytes() / n_parts
@@ -927,7 +1121,7 @@ impl Model {
                                     ptr as *mut u8,
                                     row_size / n_parts,
                                 );
-                                part_reader.read_exact(slice)?;
+                                handler.read_exact(slice, false)?;
                             }
                         }
                     } else {
@@ -943,13 +1137,13 @@ impl Model {
                                 let ptr = tensor.data().add(offset_row);
                                 let slice =
                                     std::slice::from_raw_parts_mut(ptr as *mut u8, row_size);
-                                part_reader.read_exact(slice)?;
+                                handler.read_exact(slice, do_write)?;
                             }
                         }
                     }
-
-                    total_size += tensor.nbytes() / n_parts;
                 }
+
+                total_size += tensor.nbytes() / n_parts;
 
                 n_tensors += 1;
                 load_progress_callback(LoadProgress::PartTensorLoaded {
@@ -1604,11 +1798,25 @@ impl<'a> InferenceSnapshotRef<'a> {
     pub fn write(&self, writer: &mut impl std::io::Write) -> Result<(), SnapshotError> {
         Ok(bincode::serialize_into(writer, &self)?)
     }
+
+    pub fn write_to_disk(&self, path: impl AsRef<Path>) -> Result<(), SnapshotError> {
+        let path = path.as_ref();
+        let mut writer = BufWriter::new(File::create(path)?);
+
+        self.write(&mut writer)
+    }
 }
 
 impl InferenceSnapshot {
     pub fn read(reader: &mut impl std::io::Read) -> Result<Self, SnapshotError> {
         Ok(bincode::deserialize_from(reader)?)
+    }
+
+    pub fn load_from_disk(path: impl AsRef<Path>) -> Result<Self, SnapshotError> {
+        let path = path.as_ref();
+        let mut reader = BufReader::new(File::open(path)?);
+
+        Self::read(&mut reader)
     }
 }
 

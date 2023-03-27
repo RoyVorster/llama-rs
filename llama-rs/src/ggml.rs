@@ -17,6 +17,21 @@ pub const TYPE_I32: ggml_raw::ggml_type = ggml_raw::GGML_TYPE_I32;
 pub const TYPE_F16: ggml_raw::ggml_type = ggml_raw::GGML_TYPE_F16;
 pub const TYPE_F32: ggml_raw::ggml_type = ggml_raw::GGML_TYPE_F32;
 
+pub type QuantizationFunction = fn(
+    source: &Vec<f32>,
+    destination: &mut Vec<f32>,
+    n_elements: i32,
+    n_rows: i32,
+    qk: i32,
+    history: &mut Vec<i64>
+) -> usize;
+
+#[derive(Debug)]
+pub enum QuantizationMethod {
+    Q4_0,
+    Q4_1,
+}
+
 /// Acts as a RAII-guard over a `ggml_raw::ggml_context`, allocating via
 /// ggml_init and dropping via ggml_free
 pub struct Context {
@@ -228,6 +243,10 @@ impl Tensor {
         })
     }
 
+    pub fn ndims(&self) -> usize {
+        self.get_ne().iter().filter(|&n| *n > 1).count()
+    }
+
     pub fn get_ne(&self) -> [i32; 4] {
         self.with_alive_ctx(|| unsafe { *self.ptr.as_ptr() }.ne)
     }
@@ -290,4 +309,20 @@ pub fn type_sizef(x: ggml_raw::ggml_type) -> f64 {
 
 pub fn blck_size(t: Type) -> i32 {
     unsafe { ggml_raw::ggml_blck_size(t) }
+}
+
+pub fn fp16_to_fp32(x: ggml_raw::ggml_fp16) -> f32 {
+    unsafe { ggml_raw::ggml_fp16_to_fp32(x) }
+}
+
+pub fn fp32_to_fp16(x: f32) -> ggml_raw::ggml_fp16 {
+    unsafe { ggml_raw::ggml_fp32_to_fp16(x) }
+}
+
+pub fn ggml_quantize_q4_0(src: &Vec<f32>, dst: &mut Vec<f32>, n: i32, k: i32, qk: i32, hist: &mut Vec<i64>) -> usize {
+    unsafe { ggml_raw::ggml_quantize_q4_0(src.as_ptr(), dst.as_mut_ptr(), n, k, qk, hist.as_mut_ptr()) }
+}
+
+pub fn ggml_quantize_q4_1(src: &Vec<f32>, dst: &mut Vec<f32>, n: i32, k: i32, qk: i32, hist: &mut Vec<i64>) -> usize {
+    unsafe { ggml_raw::ggml_quantize_q4_1(src.as_ptr(), dst.as_mut_ptr(), n, k, qk, hist.as_mut_ptr()) }
 }
