@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use llama_rs::TokenBias;
+use llama_rs::{TokenBias, QuantizationMethod};
 use once_cell::sync::Lazy;
 
 #[derive(Parser, Debug)]
@@ -115,9 +115,17 @@ pub struct Args {
     /// and then as a list of comma seperated string keys and token ID values.
     #[arg(long, default_value_t = false)]
     pub dump_prompt_tokens: bool,
+
+    /// Quantization method. If set, quantize the model in desired way
+    #[arg(long, default_value = None, value_parser = parse_quantization_method)]
+    pub quantization_method: Option<QuantizationMethod>,
 }
 
 fn parse_bias(s: &str) -> Result<TokenBias, String> {
+    s.parse()
+}
+
+fn parse_quantization_method(s: &str) -> Result<QuantizationMethod, String> {
     s.parse()
 }
 

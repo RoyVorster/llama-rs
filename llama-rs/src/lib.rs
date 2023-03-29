@@ -9,14 +9,40 @@ use std::{
     str::FromStr,
     time,
 };
-
-use ggml::QuantizationMethod;
 use thiserror::Error;
 
 use partial_sort::PartialSort;
 use rand::{distributions::WeightedIndex, prelude::Distribution};
 
 pub const EOD_TOKEN_ID: TokenId = 2; // Hardcoded (for now?)
+
+#[derive(Debug, Clone)]
+pub enum QuantizationMethod {
+    Q4_0,
+    Q4_1,
+}
+
+impl std::fmt::Display for QuantizationMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            QuantizationMethod::Q4_0 => "Q4_0",
+            QuantizationMethod::Q4_1 => "Q4_1",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl std::str::FromStr for QuantizationMethod {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Q4_0" => Ok(QuantizationMethod::Q4_0),
+            "Q4_1" => Ok(QuantizationMethod::Q4_1),
+            _ => Err(format!("Invalid quantization method given: {}", s)),
+        }
+    }
+}
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Hyperparameters {
@@ -364,6 +390,10 @@ pub enum LoadProgress<'a> {
         byte_size: usize,
         tensor_count: usize,
     },
+    QuantizingLayer {
+        file: &'a Path,
+        layer_name: &'a str,
+    },
 }
 
 #[derive(Error, Debug)]
@@ -383,6 +413,10 @@ pub enum LoadError {
     WriteFailed {
         source: std::io::Error,
         bytes: usize,
+    },
+    #[error("failed to flush file")]
+    FlushFailed {
+        source: std::io::Error,
     },
     #[error("unable to read exactly {bytes} bytes")]
     ReadExactFailed {
@@ -478,14 +512,14 @@ impl DataForQuantization {
 
     fn with_capacity(n_elements: i32, n_rows: i32) -> Self {
         DataForQuantization {
-            data_f16: Vec::<ggml_raw::ggml_fp16>::with_capacity(n_elements as usize),
-            data_f32: Vec::<f32>::with_capacity(n_elements as usize),
-            work: Vec::<f32>::with_capacity(n_elements as usize),
+            data_f16: vec![0; n_elements as usize],
+            data_f32: vec![0 as f32; n_elements as usize],
+            work: vec![0 as f32; n_elements as usize],
+            history: vec![0; 1 << 4],
             n_elements,
-                n_rows,
-                history: Vec::<i64>::with_capacity(1 << 4),
-            }
+            n_rows,
         }
+    }
 
     fn load_f16(handler: &mut ReadWrite, n_elements: i32, n_rows: i32) -> Result<Self, LoadError> {
         let mut data = Self::with_capacity(n_elements, n_rows);
@@ -547,9 +581,17 @@ impl ReadWrite {
         Ok(())
     }
 
+    fn flush(&mut self) -> Result<(), LoadError> {
+        if let Some(writer) = &mut self.writer {
+            writer.flush().map_err(|e| LoadError::FlushFailed { source: e })?
+        }
+
+        Ok(())
+    }
+
     fn write(&mut self, bytes: &[u8]) -> Result<(), LoadError> {
-        if let Some(output_file) = &mut self.writer {
-            output_file
+        if let Some(writer) = &mut self.writer {
+            writer
                 .write(bytes)
                 .map_err(|e| LoadError::WriteFailed {
                     source: e,
@@ -628,41 +670,37 @@ impl Model {
         n_ctx: i32,
         load_progress_callback: impl Fn(LoadProgress),
     ) -> ModelLoadResult {
-        Model::load_and_quantize(path, n_ctx, load_progress_callback, None, None::<String>)
-    }
-
-    pub fn quantize(
-        path: impl AsRef<Path>,
-        n_ctx: i32,
-        load_progress_callback: impl Fn(LoadProgress),
-        quantization_method: &QuantizationMethod,
-    ) -> Result<(), LoadError> {
-        let main_path = path.as_ref();
-        let file_name = match main_path.file_name().and_then(|f| f.to_str()) {
-            Some(file_name) => file_name.to_owned(),
-            None => return Err(LoadError::InvalidFilePath { path: main_path.to_owned() }),
-        };
-
-        // Get output path through concatenation
-        let output_path = main_path.with_file_name(file_name + "_quantized");
-        Model::load_and_quantize(path, n_ctx, load_progress_callback, Some(quantization_method), Some(output_path))?;
-        Ok(())
+        Model::load_and_quantize(path, n_ctx, None, load_progress_callback)
     }
 
     pub fn load_and_quantize(
         path: impl AsRef<Path>,
         n_ctx: i32,
-        load_progress_callback: impl Fn(LoadProgress),
         quantization_method: Option<&QuantizationMethod>,
-        output_path: Option<impl AsRef<Path>>,
+        load_progress_callback: impl Fn(LoadProgress),
     ) -> ModelLoadResult {
         let main_path = path.as_ref();
+
+        let output_path = match quantization_method {
+            Some(method) => {
+                let file_name = match main_path.file_stem().and_then(|f| f.to_str()) {
+                    Some(file_name) => file_name.to_owned(),
+                    None => return Err(LoadError::InvalidFilePath { path: main_path.to_owned() }),
+                };
+
+                let method_string = method.to_string();
+                Some(main_path.with_file_name(method_string + file_name.as_str()))
+            },
+            None => None,
+        };
+
         let main_output_path = output_path.as_ref().map(|p| p.as_ref());
 
         let mut handler = ReadWrite::initialize(main_path, main_output_path)?;
 
-        let do_write: bool = main_output_path.is_some();
+        // Set separately in case we wish to just write or there's some other condition
         let do_quantize = quantization_method.is_some();
+        let do_write: bool = main_output_path.is_some();
 
         // Verify magic
         let is_legacy_model: bool = match handler.read_i32(do_write)? {
@@ -928,10 +966,79 @@ impl Model {
 
                 let tensor_name = handler.read_string(length as usize, do_write)?;
 
-                let Some(tensor) = model.tensors.get(&tensor_name)
-                    else {
-                        return Err(LoadError::UnknownTensor { tensor_name, path: part_path });
-                    };
+                let tensor = match model.tensors.get(&tensor_name) {
+                    Some(t) => t,
+                    None => return Err(LoadError::UnknownTensor { tensor_name, path: part_path }),
+                };
+
+                let bpe = match (ftype, do_quantize) {
+                    (0, _) => ggml::type_size(ggml::TYPE_F32),
+                    (1, _) => ggml::type_size(ggml::TYPE_F16),
+                    // These two arms suggest the model was already quantized
+                    (2, false) => {
+                        assert_eq!(ne[0] % 64, 0);
+                        ggml::type_size(ggml::TYPE_Q4_0)
+                    }
+                    (3, false) => {
+                        assert_eq!(ne[0] % 64, 0);
+                        ggml::type_size(ggml::TYPE_Q4_1)
+                    }
+                    (2 | 3, true) => {
+                        return Err(LoadError::ModelAlreadyQuantized {
+                            ftype,
+                            path: part_path
+                        })
+                    }
+                    (_, _) => {
+                        return Err(LoadError::InvalidFtype {
+                            ftype,
+                            path: part_path,
+                        })
+                    }
+                };
+
+                // If this is a quantization run we simply load the raw data in the desired format
+                if do_quantize {
+                    load_progress_callback(LoadProgress::QuantizingLayer {
+                        file: &part_path,
+                        layer_name: &tensor_name,
+                    });
+
+                    if n_dims == 2 {
+                        // TODO: Parallelizing here is an obvious next step. Simply read in multiple DataForQuantization
+                        // objects and then call quantize on them in parallel, then write sequentially at the end
+                        // This should be very straightforward with this structure
+                        let mut quantization_data = match ftype {
+                            0 => DataForQuantization::load_f32(&mut handler, nelements, ne[0])?,
+                            1 => DataForQuantization::load_f16(&mut handler, nelements, ne[0])?,
+                            _ => return Err(LoadError::InvalidFtype {
+                                ftype,
+                                path: part_path,
+                            }),
+                        };
+
+                        let quantization_function: ggml::QuantizationFunction = match quantization_method {
+                            Some(QuantizationMethod::Q4_0) => ggml::ggml_quantize_q4_0,
+                            Some(QuantizationMethod::Q4_1) => ggml::ggml_quantize_q4_1,
+                            _ => return Err(LoadError::InvalidQuantizationMethod),
+                        };
+                        let new_size = quantization_data.quantize(quantization_function);
+
+                        // Write the raw bytes
+                        let mut new_data_bytes = Vec::<u8>::with_capacity(new_size);
+                        for i in 0..(new_size / 4) {
+                            new_data_bytes.extend_from_slice(&quantization_data.work[i].to_le_bytes());
+                        }
+
+                        handler.write(&new_data_bytes)?;
+                    } else {
+                        let mut buffer = vec![0; (nelements as usize) * bpe];
+                        handler.read_exact(&mut buffer, true)?;
+                    }
+
+                    // No need to parse weights when we're quantizing
+                    continue;
+                }
 
                 // split_type = 0: split by columns
                 // split_type = 1: split by rows
@@ -1004,69 +1111,6 @@ impl Model {
                         tensor_name,
                         path: part_path,
                     });
-                }
-
-                let bpe = match (ftype, do_quantize) {
-                    (0, _) => ggml::type_size(ggml::TYPE_F32),
-                    (1, _) => ggml::type_size(ggml::TYPE_F16),
-                    // These two arms suggest the model was already quantized
-                    (2, false) => {
-                        assert_eq!(ne[0] % 64, 0);
-                        ggml::type_size(ggml::TYPE_Q4_0)
-                    }
-                    (3, false) => {
-                        assert_eq!(ne[0] % 64, 0);
-                        ggml::type_size(ggml::TYPE_Q4_1)
-                    }
-                    (2 | 3, true) => {
-                        return Err(LoadError::ModelAlreadyQuantized {
-                            ftype,
-                            path: part_path
-                        })
-                    }
-                    (_, _) => {
-                        return Err(LoadError::InvalidFtype {
-                            ftype,
-                            path: part_path,
-                        })
-                    }
-                };
-
-                // If this is a quantization run we simply load the raw data in the desired format
-                if do_quantize {
-                    if n_dims == 2 {
-                        let mut quantization_data = match ftype {
-                            ggml::TYPE_F16 => DataForQuantization::load_f16(&mut handler, nelements, ne[0])?,
-                            ggml::TYPE_F32 => DataForQuantization::load_f32(&mut handler, nelements, ne[0])?,
-                            _ => return Err(LoadError::InvalidFtype {
-                                ftype,
-                                path: part_path,
-                            }),
-                        };
-
-                        let quantization_function: ggml::QuantizationFunction = match quantization_method {
-                            Some(QuantizationMethod::Q4_0) => ggml::ggml_quantize_q4_0,
-                            Some(QuantizationMethod::Q4_1) => ggml::ggml_quantize_q4_1,
-                            _ => return Err(LoadError::InvalidQuantizationMethod),
-                        };
-                        let new_size = quantization_data.quantize(quantization_function);
-
-                        // Write the raw bytes
-                        let new_data_bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                quantization_data.work.as_ptr() as *const u8,
-                                new_size,
-                            )
-                        };
-
-                        handler.write(new_data_bytes)?;
-                    } else {
-                        let mut buffer = vec![0; (nelements as usize) * bpe];
-                        handler.read_exact(&mut buffer, true)?;
-                    }
-
-                    // No need to parse weights when we're quantizing
-                    continue;
                 }
 
                 if n_dims == 1 || n_parts == 1 {
@@ -1153,11 +1197,15 @@ impl Model {
                 });
             }
 
-            load_progress_callback(LoadProgress::PartLoaded {
-                file: &part_path,
-                byte_size: total_size,
-                tensor_count: n_tensors.try_into()?,
-            });
+            handler.flush()?;
+
+            if !do_quantize {
+                load_progress_callback(LoadProgress::PartLoaded {
+                    file: &part_path,
+                    byte_size: total_size,
+                    tensor_count: n_tensors.try_into()?,
+                });
+            }
         }
 
         Ok((model, vocab))

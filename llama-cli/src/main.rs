@@ -3,7 +3,7 @@ use std::{convert::Infallible, io::Write, path::Path};
 use cli_args::CLI_ARGS;
 use llama_rs::{
     InferenceError, InferenceParameters, InferenceSessionParameters, InferenceSnapshot,
-    ModelKVMemoryType, TokenBias, Model, Vocabulary, EOD_TOKEN_ID,
+    ModelKVMemoryType, TokenBias, Model, Vocabulary, EOD_TOKEN_ID, QuantizationMethod,
 };
 use rand::{thread_rng, SeedableRng};
 use rustyline::error::ReadlineError;
@@ -89,8 +89,13 @@ fn dump_tokens(text: &str, vocab: &Vocabulary) -> Result<(), InferenceError> {
     Ok(())
 }
 
+<<<<<<< HEAD
 fn load_model_with_progress(model_path: &String, n_ctx: usize) -> (Model, Vocabulary) {
     let (model, vocab) = llama_rs::Model::load(&args.model_path, args.num_ctx_tokens as i32, |progress| {
+=======
+fn load_model_with_progress(model_path: &String, n_ctx: usize, quantization_method: Option<&QuantizationMethod>) -> (Model, Vocabulary) {
+    let (model, vocab) = llama_rs::Model::load_and_quantize(model_path, n_ctx as i32, quantization_method, |progress| {
+>>>>>>> 221bbf6 (Make this work kind of mostly maybe almost)
         use llama_rs::LoadProgress;
         match progress {
             LoadProgress::HyperparametersLoaded(hparams) => {
@@ -126,7 +131,7 @@ fn load_model_with_progress(model_path: &String, n_ctx: usize) -> (Model, Vocabu
                 if current_tensor % 8 == 0 {
                     log::info!("Loaded tensor {current_tensor}/{tensor_count}");
                 }
-            }
+            },
             LoadProgress::PartLoaded {
                 file,
                 byte_size,
@@ -138,7 +143,13 @@ fn load_model_with_progress(model_path: &String, n_ctx: usize) -> (Model, Vocabu
                     byte_size as f64 / 1024.0 / 1024.0,
                     tensor_count
                 );
-            }
+            },
+            LoadProgress::QuantizingLayer {
+                file,
+                layer_name,
+            } => {
+                log::info!("Quantizing layer {} in {}...", layer_name, file.to_string_lossy())
+            },
         }
     })
     .expect("Could not load model");
@@ -151,10 +162,47 @@ fn load_model_with_progress(model_path: &String, n_ctx: usize) -> (Model, Vocabu
 fn main() {
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
+
         .parse_default_env()
         .init();
 
     let args = &*CLI_ARGS;
+
+    let do_quantization = args.quantization_method.is_some();
+    if do_quantization {
+        log::info!("Quantizing model {}", args.quantization_method.clone().unwrap());
+    }
+
+    let prompt = if let Some(path) = &args.prompt_file {
+        match std::fs::read_to_string(path) {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                log::error!("Could not read prompt file at {path}. Error {err}");
+                std::process::exit(1);
+            }
+        }
+    } else if let Some(prompt) = &args.prompt {
+        prompt.clone()
+    } else {
+        "".to_string()
+    };
+
+    // Check either quantizing or a prompt should be supplied
+    if !do_quantization && prompt.as_str() == "" {
+        log::error!("No prompt or prompt file was provided. See --help");
+        std::process::exit(1);
+    }
+
+    let (mut model, vocab) = load_model_with_progress(&args.model_path, args.num_ctx_tokens, args.quantization_method.as_ref());
+
+    if do_quantization {
+        return;
+    }
+
+    if args.dump_prompt_tokens {
+        dump_tokens(&prompt, &vocab).ok();
+        return;
+    }
 
     let inference_params = InferenceParameters {
         n_threads: args.num_threads as i32,

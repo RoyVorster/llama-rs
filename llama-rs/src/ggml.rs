@@ -26,12 +26,6 @@ pub type QuantizationFunction = fn(
     history: &mut Vec<i64>
 ) -> usize;
 
-#[derive(Debug)]
-pub enum QuantizationMethod {
-    Q4_0,
-    Q4_1,
-}
-
 /// Acts as a RAII-guard over a `ggml_raw::ggml_context`, allocating via
 /// ggml_init and dropping via ggml_free
 pub struct Context {
