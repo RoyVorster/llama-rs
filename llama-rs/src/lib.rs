@@ -736,7 +736,14 @@ impl Model {
             n_head: handler.read_i32(do_write)?,
             n_layer: handler.read_i32(do_write)?,
             n_rot: handler.read_i32(do_write)?,
-            f16_: handler.read_i32(do_write)?,
+            f16_: handler.read_i32(false)?,
+        };
+
+        // Write correct quantization type
+        match quantization_method {
+            Some(QuantizationMethod::Q4_0) => handler.write(&(2 as i32).to_le_bytes())?,
+            Some(QuantizationMethod::Q4_1) => handler.write(&(3 as i32).to_le_bytes())?,
+            _ => (),
         };
 
         let n_ff =
@@ -955,7 +962,19 @@ impl Model {
 
                 let n_dims = handler.read_i32(do_write)?;
                 let length = handler.read_i32(do_write)?;
-                let ftype = handler.read_i32(do_write)?;
+                let ftype = handler.read_i32(false)?;
+
+                // Make sure to write back correct ftype
+                if do_write {
+                    match (n_dims, quantization_method) {
+                        (2, Some(QuantizationMethod::Q4_0)) => handler.write(&(2 as i32).to_le_bytes())?,
+                        (2, Some(QuantizationMethod::Q4_1)) => handler.write(&(3 as i32).to_le_bytes())?,
+
+                        // Quantizing but n_dims != 2, write back normal ftype
+                        (_, Some(_)) => handler.write(&ftype.to_le_bytes())?,
+                        _ => (),
+                    };
+                }
 
                 let mut nelements = 1;
                 let mut ne = [1i32, 1i32];

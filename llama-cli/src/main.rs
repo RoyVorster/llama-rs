@@ -89,13 +89,8 @@ fn dump_tokens(text: &str, vocab: &Vocabulary) -> Result<(), InferenceError> {
     Ok(())
 }
 
-<<<<<<< HEAD
-fn load_model_with_progress(model_path: &String, n_ctx: usize) -> (Model, Vocabulary) {
-    let (model, vocab) = llama_rs::Model::load(&args.model_path, args.num_ctx_tokens as i32, |progress| {
-=======
 fn load_model_with_progress(model_path: &String, n_ctx: usize, quantization_method: Option<&QuantizationMethod>) -> (Model, Vocabulary) {
     let (model, vocab) = llama_rs::Model::load_and_quantize(model_path, n_ctx as i32, quantization_method, |progress| {
->>>>>>> 221bbf6 (Make this work kind of mostly maybe almost)
         use llama_rs::LoadProgress;
         match progress {
             LoadProgress::HyperparametersLoaded(hparams) => {
